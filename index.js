@@ -4,33 +4,46 @@ const sendgridMail = require('@sendgrid/mail');
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns'); 
 const { QueryTypes } = require('sequelize');  
 require('dotenv').config();
-
-sendgridMail.setApiKey(process.env.SENDGRID_API_KEY);
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
 const region = process.env.AWS_REGION;
+
+const secretsClient = new SecretsManagerClient({ region: process.env.AWS_REGION });
 
 const snsClient = new SNSClient({
     region: region, 
 });
-const sequelize = new Sequelize(process.env.DB_NAME, process.env.DB_USER, process.env.DB_PASSWORD, {
-    host: process.env.DB_HOST,
-    dialect: 'mysql',
-});
 
-async function sendVerificationEmail(event) {
+async function getSecrets(secretName) {
+    const command = new GetSecretValueCommand({ SecretId: secretName });
+    const response = await secretsClient.send(command);
+
+    if (response.SecretString) {
+        return JSON.parse(response.SecretString);
+    }
+    throw new Error('Secret is not in string format');
+}
+
+async function sendVerificationEmail(event, secrets) {
+    sendgridMail.setApiKey(secrets.SENDGRID_API_KEY);  
+
     const messagePayload = JSON.parse(event.Records[0].Sns.Message);
     const { firstName, lastName, email } = messagePayload;
     const verificationToken = uuid.v4();
-    const verificationUrl = `http://${process.env.DOMAIN}/v1/user/checkemail?token=${verificationToken}`;
+    const verificationUrl = `https://${secrets.DOMAIN}/v1/user/checkemail?token=${verificationToken}`;
     let emailStatus = 'Pending';
-    let response;
+
+    const sequelize = new Sequelize(secrets.DATABASE_NAME, secrets.DATABASE_USERNAME, secrets.DATABASE_PASSWORD, {
+        host: secrets.DATABASE_HOST,
+        dialect: 'mysql',
+    });
 
     let userEmail = '';
     try {
         const user = await sequelize.query(
             'SELECT email FROM Users WHERE email = :email',
             {
-                replacements: { email },  
+                replacements: { email },
                 type: QueryTypes.SELECT,
             }
         );
@@ -47,15 +60,15 @@ async function sendVerificationEmail(event) {
 
     if (emailStatus === 'Pending') {
         const msgdata = {
-            to: userEmail,  
-            from: `noreply@${process.env.DOMAIN}`,
+            to: userEmail,
+            from: `noreply@${secrets.DOMAIN}`,
             subject: 'Verify Your Email Address',
             text: `Hello ${firstName} ${lastName},\n\nPlease click the link below to verify your email address:\n\n${verificationUrl}`,
             html: `<strong>Hello ${firstName} ${lastName},</strong><br><br>Please click the link below to verify your email address:<br><br><a href="${verificationUrl}">${verificationUrl}</a>`,
         };
 
         try {
-            response = await sendgridMail.send(msgdata);
+            await sendgridMail.send(msgdata);
             emailStatus = 'Sent';
         } catch (error) {
             emailStatus = 'Failed';
@@ -114,7 +127,7 @@ async function sendVerificationEmail(event) {
         console.error(`Failed to log email event for ${email}: ${logError.message}`);
     }
 
-    const snsTopicArn = process.env.SNS_TOPIC_ARN;
+    const snsTopicArn = secrets.SNS_TOPIC_ARN;
 
     if (!snsTopicArn) {
         console.error('SNS_TOPIC_ARN is not defined in environment variables');
@@ -137,7 +150,10 @@ async function sendVerificationEmail(event) {
 
 exports.handler = async (event) => {
     try {
-        await sendVerificationEmail(event);
+        const secretName = process.env.SECRET_NAME;
+        const secrets = await getSecrets(secretName); 
+        console.log('Fetched secrets:', secrets);
+        await sendVerificationEmail(event, secrets);
     } catch (error) {
         console.error('Error in Lambda function:', error.message);
     }
